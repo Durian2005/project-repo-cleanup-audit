@@ -80,31 +80,20 @@ du -sm <大目录>/* | sort -rn | head -12                     # 再往里钻一
 
 **第 2 步** 回收脚本**解析清单**取路径 ⇒ 保证"看到什么就删什么"，不会漏也不会多。
 
+回收动作**直接调公共模块**，不要在项目里再写一份 `SHFileOperationW`：
+
 ```python
-import ctypes, os, re
-from ctypes import wintypes
+from recycle_bin import recycle        # 来自 scripts/recycle_bin.py
 
-FO_DELETE = 3
-FLAGS = 0x0004 | 0x0010 | 0x0040 | 0x0400 | 0x0200   # SILENT|NOCONFIRM|ALLOWUNDO|NOERRORUI|NOCONFIRMMKDIR
-
-class SHFILEOPSTRUCTW(ctypes.Structure):
-    _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT),
-                ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
-                ("fFlags", ctypes.c_uint16), ("fAnyOperationsAborted", wintypes.BOOL),
-                ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
-
-def recycle(path):
-    op = SHFILEOPSTRUCTW()
-    op.wFunc = FO_DELETE
-    op.pFrom = path + "\0\0"        # 必须双 NUL 结尾
-    op.fFlags = FLAGS
-    ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
-    return not os.path.exists(path)  # 判据只能用 exists，函数返回值/异常都不可靠
+for path, ok, note in recycle(paths_from_manifest):
+    print("[%s] %s  %s" % ("OK  " if ok else "FAIL", path, note))
 ```
+
+模块内部已经处理了这四条（都是实测换来的）：
 
 - **一次一个路径**。多路径一次传入会中途失败，还返回 2 却已经删掉几个。
 - 成败判据**只认** `os.path.exists` ⇒ 删成功也可能返回非零码。
-- 被进程占用的项跳过即可，别让一项拖垮整批。
+- 被进程占用的项跳过即可，别让一项拖垮整批（`pFrom` 双 NUL 结尾等细节也在模块里）。
 - ⚠️ **解析清单必须用正则，不能按空格切分**。清单行形如 `DIR  10705 B  <相对路径>  (5 个文件)`，
   按空格切会把 `10705 B` 一并当成路径 ⇒ 白名单校验必然失败。用
   `^\s*DIR\s+\d+\s+B\s+(\S+)\s+\(\d+` 取路径。（本案首轮就因此触发中止 —— 见下条。）
@@ -120,11 +109,44 @@ def recycle(path):
      只在 basename **唯一且够长**时才有意义。遇到 `publish` / `bin` / `tmp` / `dist` 这类常见名会
      命中几十条噪音（实测按 `publish` 搜出 **32 项**），既不能证明删到了，也不能证明没删到。
      它只适合当"探针文件"这类唯一名字的快查。
-   - **按路径解析（唯一可靠）**：⚠️ **不要假设路径偏移**。实测 `offset 24` 解出来是单字符垃圾
-     （`16:20` 那 4 字节是 FILETIME 低位，不是路径长度）。稳妥做法：整个 `$I` 按 UTF-16LE
-     在 **0 / 1 两种对齐**下各解一遍，用 `[A-Za-z]:\\[^\x00-\x1f<>|"*?]{0,500}` 正则抓最长的那个；
-     再把解出的原始路径与**目标绝对路径逐字符比对**（去尾 `\`、大小写不敏感）才算通过。
+   - **按路径解析（唯一可靠）**：路径从 **offset 28** 起，不是 24。
+     `$I` 布局：`0`(8B 版本) / `8`(8B 原字节数) / `16`(8B 删除时间 FILETIME) /
+     `24`(4B 文件名字符数，含结尾 `\0`) / **`28`(变长，UTF-16LE 文件名)**。
+     ⚠️ 按 24 解析会**多解出一个前导垃圾字符**（就是 24 处那 4 字节长度字段的低位字节）。
+     它随文件名长度变化（实测见过 `\x19` 与 `T\x00`），肉眼看不出来、`in` 判断也照样通过，
+     但做**精确相等**比对时必然失败，会误判成"回收站里没有该文件"。
+     2026-10-07 用本机 400 条真实 `$I` 做过对照：**offset 28 → 400/400 合法；offset 24 → 0/400**。
+   - 解出的路径要与**目标绝对路径逐字符比对**（去尾 `\`、大小写不敏感）才算通过。
    - `$I` 与 `$R` **后缀相同**，可据此把索引与数据体配成对。
+   - **实现直接用 `scripts/recycle_bin.py`，不要另写一份**（见下方"公共实现"）。
+
+> ### 公共实现：`scripts/recycle_bin.py`
+>
+> 送回收站、解析 `$I`/`$R`、核验"是否真进了回收站"这三件事，**本文件与
+> `windows-cleanup-audit` 共用同一份代码** —— 别在各自的 SKILL.md 里再抄一遍实现，
+> 否则改一处漏一处（这类同源重复已经咬过一次：`$I` 偏移两个技能各写了一个说法）。
+>
+> ```bash
+> python scripts/recycle_bin.py list                 # 列出回收站全部条目（含原始路径）
+> python scripts/recycle_bin.py verify <绝对路径>...  # 核验已回收（按路径精确比对）
+> python scripts/recycle_bin.py delete <绝对路径>...  # 送回收站（可还原，需确认）
+> ```
+>
+> 作为模块用时：
+> ```python
+> from recycle_bin import recycle, verify_recycled, list_recycle_bin, find_orphans
+> recycle(paths)                      # 逐个送回收站，每项独立成败
+> ok, failed, details = verify_recycled(targets)
+> ```
+>
+> 三条实测纪律已经写进模块，调用方不用再记：
+> ① **返回码不可信**（`FO_DELETE` 成功也可能返回 2），判据只有"目标是否还存在"；
+> ② **一次只传一个路径**，多路径会中途失败却只删掉一部分；
+> ③ **`$I` 路径从 offset 28 起**，模块内部用结构体解析 + 双对齐正则兜底。
+>
+> 模块自带端到端自测（16 项：送回收 → 核验 → 反例验证 → 4000+ 条真实条目解析），
+> 2026-10-07 实测全绿。**改完模块必须重跑它** —— 尤其别省掉"不存在的路径必须报 FAIL"
+> 这条反例，它是唯一能证明核验逻辑没有退化成"永远返回成功"的用例。
 3. `git status` 应仍与清理前一致（除了你刻意 `git rm` 的）。
 4. 改动过源码就重编一次（`dotnet build -c Release` 之类），确认为 0 错误 0 警告。
 5. 报体积前后对比，并**明说"进回收站 ≠ 空间已释放"**。
@@ -135,9 +157,11 @@ def recycle(path):
 ② 确认里面**没有**活跃项目文件；③ 用户已明确说"可以清了"。
 
 ```python
-import ctypes
-# 所有卷、当前用户；flags = 无确认框|无进度条|无声
-rc = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 0x1 | 0x2 | 0x4)  # 0 == S_OK
+from recycle_bin import empty_recycle_bin, list_recycle_bin, find_orphans
+
+for e in list_recycle_bin():            # ① 先留档
+    print(e["size"], e["path"])
+empty_recycle_bin()                     # 所有卷 / 当前用户，0 == S_OK
 ```
 
 **清空后通常还剩两类残留，`SHEmptyRecycleBinW` 都不管**，需再手动清一遍：
